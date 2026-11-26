@@ -35,8 +35,15 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
 #include <zmk/event_manager.h>
 #include <zmk/events/split_peripheral_status_changed.h>
+#if IS_ENABLED(CONFIG_ZMK_SLEEP)
+#include <zmk/events/activity_state_changed.h>
+#endif
 #include <zmk/ble.h>
 #include <zmk/split/bluetooth/uuid.h>
+
+#define PERIPHERAL_ADV_RETRY_MS 250
+#define PERIPHERAL_ADV_ERR_RESTART_MS 100
+#define PERIPHERAL_ADV_DISCONN_RESTART_MS 50
 
 static const struct bt_data zmk_ble_ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -74,15 +81,21 @@ static int start_advertising(bool low_duty) {
 
 static bool low_duty_advertising = false;
 static bool enabled = false;
+static bool sleeping = false;
+
+static struct k_work_delayable advertising_work;
 
 static void advertising_cb(struct k_work *work) {
+    if (!enabled || is_connected || sleeping) {
+        return;
+    }
+
     const int err = start_advertising(low_duty_advertising);
-    if (err < 0) {
-        LOG_ERR("Failed to start advertising (%d)", err);
+    if (err < 0 && err != -EALREADY) {
+        LOG_ERR("Failed to start advertising (%d), retrying in %dms", err, PERIPHERAL_ADV_RETRY_MS);
+        k_work_reschedule(&advertising_work, K_MSEC(PERIPHERAL_ADV_RETRY_MS));
     }
 }
-
-K_WORK_DEFINE(advertising_work, advertising_cb);
 
 static void connected(struct bt_conn *conn, uint8_t err) {
     is_connected = (err == 0);
@@ -90,9 +103,15 @@ static void connected(struct bt_conn *conn, uint8_t err) {
     raise_zmk_split_peripheral_status_changed(
         (struct zmk_split_peripheral_status_changed){.connected = is_connected});
 
-    if (err == BT_HCI_ERR_ADV_TIMEOUT && enabled) {
-        low_duty_advertising = true;
-        k_work_submit(&advertising_work);
+    if (err && enabled && !sleeping) {
+        if (err == BT_HCI_ERR_ADV_TIMEOUT) {
+            low_duty_advertising = true;
+            k_work_reschedule(&advertising_work, K_NO_WAIT);
+        } else {
+            LOG_WRN("Peripheral connection failed (err 0x%02x), restarting advertising", err);
+            low_duty_advertising = false;
+            k_work_reschedule(&advertising_work, K_MSEC(PERIPHERAL_ADV_ERR_RESTART_MS));
+        }
     }
 }
 
@@ -108,9 +127,9 @@ static void disconnected(struct bt_conn *conn, uint8_t reason) {
     raise_zmk_split_peripheral_status_changed(
         (struct zmk_split_peripheral_status_changed){.connected = is_connected});
 
-    if (enabled) {
+    if (enabled && !sleeping) {
         low_duty_advertising = false;
-        k_work_submit(&advertising_work);
+        k_work_reschedule(&advertising_work, K_MSEC(PERIPHERAL_ADV_DISCONN_RESTART_MS));
     }
 }
 
@@ -171,9 +190,12 @@ static int split_peripheral_bt_set_enabled(bool en) {
 
     enabled = en;
     if (en) {
-        k_work_submit(&advertising_work);
+        if (!sleeping) {
+            k_work_reschedule(&advertising_work, K_NO_WAIT);
+        }
         return 0;
     } else {
+        k_work_cancel_delayable(&advertising_work);
         struct bt_conn *conn = NULL;
         bt_conn_foreach(BT_CONN_TYPE_LE, find_first_conn, &conn);
         if (conn) {
@@ -263,7 +285,51 @@ static struct settings_handler ble_peripheral_settings_handler = {
 
 #endif // IS_ENABLED(CONFIG_SETTINGS)
 
+#if IS_ENABLED(CONFIG_ZMK_SLEEP)
+
+static int peripheral_activity_event_listener(const zmk_event_t *eh) {
+    const struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
+    if (ev == NULL) {
+        return -ENOTSUP;
+    }
+
+    if (ev->state == ZMK_ACTIVITY_SLEEP) {
+        sleeping = true;
+        k_work_cancel_delayable(&advertising_work);
+        bt_le_adv_stop();
+
+        struct bt_conn *conn = NULL;
+        bt_conn_foreach(BT_CONN_TYPE_LE, find_first_conn, &conn);
+        if (conn != NULL) {
+            LOG_DBG("Gracefully disconnecting from central before deep sleep");
+            int err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_POWER_OFF);
+            if (err == 0) {
+                for (int i = 0; i < 15 && is_connected; i++) {
+                    k_sleep(K_MSEC(10));
+                }
+            } else {
+                LOG_WRN("Failed to disconnect before deep sleep (%d)", err);
+            }
+        }
+    } else if (ev->state == ZMK_ACTIVITY_ACTIVE && sleeping) {
+        sleeping = false;
+        if (enabled && !is_connected) {
+            low_duty_advertising = false;
+            k_work_reschedule(&advertising_work, K_MSEC(PERIPHERAL_ADV_DISCONN_RESTART_MS));
+        }
+    }
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(split_peripheral_ble_activity, peripheral_activity_event_listener);
+ZMK_SUBSCRIPTION(split_peripheral_ble_activity, zmk_activity_state_changed);
+
+#endif /* IS_ENABLED(CONFIG_ZMK_SLEEP) */
+
 static int zmk_peripheral_ble_init(void) {
+    k_work_init_delayable(&advertising_work, advertising_cb);
+
     int err = bt_enable(NULL);
 
     if (err) {
